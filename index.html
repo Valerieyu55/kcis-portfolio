@@ -16,7 +16,8 @@
         "firebase/app": "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js",
         "firebase/firestore": "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js",
         "firebase/auth": "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js",
-        "lucide-react": "https://esm.sh/lucide-react@0.344.0"
+        "lucide-react": "https://esm.sh/lucide-react@0.344.0",
+        "xlsx": "https://esm.sh/xlsx@0.18.5"
       }
     }
     </script>
@@ -74,8 +75,9 @@
             CheckCircle2, AlertTriangle, Clock, Search, ChevronDown, ChevronRight, Download, Settings2, Trash2,
             Plus, Check, AlertCircle, Loader2, ClipboardList, X, Save, GraduationCap, Users,
             ShieldCheck, FileSpreadsheet, Settings, Cloud, Award, FileJson, Upload, UserPlus, Zap,
-            CheckSquare, Square, BarChart3, PieChart, BookOpen
+            CheckSquare, Square, BarChart3, PieChart, BookOpen, Pencil
         } from 'lucide-react';
+        import * as XLSX from 'xlsx';
 
         // --- 元件開始 ---
         const App = () => {
@@ -101,6 +103,12 @@
             const [isSemModalOpen, setIsSemModalOpen] = useState(false);
             const [isBackupModalOpen, setIsBackupModalOpen] = useState(false);
             const [isStatsModalOpen, setIsStatsModalOpen] = useState(false);
+            const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+            const [selectedExportSemesters, setSelectedExportSemesters] = useState([]);
+
+            useEffect(() => {
+                if (isExportModalOpen) setSelectedExportSemesters([currentSemester]);
+            }, [isExportModalOpen, currentSemester]);
             const [importText, setImportText] = useState('');
             const [newSemInput, setNewSemInput] = useState('');
             const [searchTerm, setSearchTerm] = useState('');
@@ -388,6 +396,31 @@
                 } catch (error) { console.error(error); } finally { setIsSaving(false); }
             };
 
+            const updateItemTitle = (studentId, listKey, itemId, newTitle) => {
+                const newData = JSON.parse(JSON.stringify(allData));
+                const student = newData[currentSemester].find(s => s.id === studentId);
+                if (student) {
+                    const list = student[listKey] || [];
+                    const itemIndex = list.findIndex(i => i.id === itemId);
+                    if (itemIndex > -1) {
+                        list[itemIndex].title = newTitle; // For courseDetails (new prop) or diverseDetails (existing)
+                        // Trigger auto-save
+                        setAllData(newData);
+                        debouncedSave(newData);
+                    }
+                }
+            };
+
+            const updateStudentFinalCounts = (studentId, key, value) => {
+                const newData = JSON.parse(JSON.stringify(allData));
+                const student = newData[currentSemester].find(s => s.id === studentId);
+                if (student) {
+                    student[key] = value;
+                    setAllData(newData);
+                    debouncedSave(newData);
+                }
+            };
+
             const handleBatchImport = async () => {
                 const lines = importText.split('\n').filter(l => l.trim().length > 0);
                 if (lines.length === 0) { setIsImportModalOpen(false); return; }
@@ -600,64 +633,94 @@
                 reader.readAsText(file);
             };
 
-            // 匯出報表
-            const exportToCSV = () => {
-                // 1. Gather ALL students from all classes
-                let allStudents = [];
-                CLASSES.forEach(cls => {
-                    const studentsInClass = (allData[currentSemester] || []).filter(s => s.class === cls);
-                    // Sort by ID
-                    studentsInClass.sort((a, b) => a.id.localeCompare(b.id));
-                    allStudents = allStudents.concat(studentsInClass);
+            // 匯出報表 (Excel .xlsx)
+            const exportToExcel = (targetSemesters) => {
+                const wb = XLSX.utils.book_new();
+
+                targetSemesters.forEach((sem) => {
+                    const isSem2 = sem.endsWith('-2');
+                    const sheetData = [];
+
+                    // --- 1. Statistics Section ---
+                    sheetData.push([`=== 學期報表: ${sem} ===`]);
+                    sheetData.push(["--- 統計摘要 ---"]);
+                    sheetData.push(["班級", "總人數", "課程總件數", "課程參與率", "多元總件數", "多元參與率"]);
+
+                    // Gather Data
+                    CLASSES.forEach(cls => {
+                        const students = (allData[sem] || []).filter(s => s.class === cls);
+                        const totalStudents = students.length || 1;
+                        const courseCount = students.reduce((acc, s) => acc + (s.courseDetails?.length || 0), 0);
+                        const coursePart = Math.round((students.filter(s => (s.courseDetails?.length || 0) > 0).length / totalStudents) * 100) + "%";
+                        const diverseCount = students.reduce((acc, s) => acc + (s.diverseDetails?.length || 0), 0);
+                        const diversePart = Math.round((students.filter(s => (s.diverseDetails?.length || 0) > 0).length / totalStudents) * 100) + "%";
+                        sheetData.push([`${cls}班`, totalStudents, courseCount, coursePart, diverseCount, diversePart]);
+                    });
+
+                    sheetData.push([]); // Spacer
+                    sheetData.push(["--- 各科目上傳統計 ---"]);
+                    sheetData.push(["班級", "科目", "上傳總件數", "上傳人數", "參與率"]);
+
+                    CLASSES.forEach(cls => {
+                        const students = (allData[sem] || []).filter(s => s.class === cls);
+                        const totalStudents = students.length || 1;
+                        subjects.forEach(sub => {
+                            const totalItems = students.reduce((acc, s) => {
+                                const items = (s.courseDetails || []).filter(d => d.subject === sub);
+                                return acc + items.length;
+                            }, 0);
+                            const participants = students.filter(s => (s.courseDetails || []).some(d => d.subject === sub)).length;
+                            const rate = Math.round((participants / totalStudents) * 100) + "%";
+                            sheetData.push([`${cls}班`, sub, totalItems, participants, rate]);
+                        });
+                    });
+
+                    sheetData.push([]);
+                    sheetData.push([]);
+
+                    // --- 2. Student List ---
+                    const headers = ["班級", "座號", "姓名", "學期", "狀態提示", "本學期課程總數", "本學期多元總數"];
+                    if (isSem2) headers.push("學年度勾選課程件數", "學年度勾選多元件數", "老師最終核定");
+                    headers.push("錯誤明細", "修正建議", "優良註記");
+                    sheetData.push(headers);
+
+                    // Gather All Students
+                    let allStudents = [];
+                    CLASSES.forEach(cls => {
+                        const studentsInClass = (allData[sem] || []).filter(s => s.class === cls);
+                        studentsInClass.sort((a, b) => a.id.localeCompare(b.id));
+                        allStudents = allStudents.concat(studentsInClass);
+                    });
+
+                    allStudents.forEach(s => {
+                        const status = getStudentStatus(s);
+                        let label = status === 'approved' ? '已核定' : (status === 'error' ? '需修正' : (status === 'completed' ? '已達標' : '進行中'));
+                        if (status === 'empty') label = '未上傳';
+
+                        const seatNo = s.id.replace(s.class, '');
+                        const err = [...(s.courseDetails || []).filter(d => d.status === 'error').map(d => `課程-${d.subject}`), ...(s.diverseDetails || []).filter(d => d.status === 'error').map(d => `多元-${d.type}`)].join("\n");
+                        const fb = [...(s.courseDetails || []).filter(d => d.status === 'error' && d.feedback).map(d => `課程-${d.subject}:${d.feedback}`), ...(s.diverseDetails || []).filter(d => d.status === 'error' && d.feedback).map(d => `多元-${d.type}:${d.feedback}`)].join("\n");
+                        const goodFb = [...(s.courseDetails || []).filter(d => d.status === 'verified' && d.goodFeedback).map(d => `課程-${d.subject}:${d.goodFeedback}`), ...(s.diverseDetails || []).filter(d => d.status === 'verified' && d.goodFeedback).map(d => `多元-${d.type}:${d.goodFeedback}`)].join("\n");
+
+                        const row = [s.class, seatNo, s.name, sem, label, (s.courseDetails?.length || 0), (s.diverseDetails?.length || 0)];
+                        if (isSem2) {
+                            const checkedCourse = (s.finalCourseCount !== undefined && s.finalCourseCount !== "") ? pInt(s.finalCourseCount) : (s.courseDetails || []).filter(i => i.isChecked).length;
+                            const checkedDiverse = (s.finalDiverseCount !== undefined && s.finalDiverseCount !== "") ? pInt(s.finalDiverseCount) : (s.diverseDetails || []).filter(i => i.isChecked).length;
+                            row.push(checkedCourse, checkedDiverse, s.isFinalApproved ? 'V' : '');
+                        }
+                        row.push(err, fb, goodFb);
+                        sheetData.push(row);
+                    });
+
+                    const ws = XLSX.utils.aoa_to_sheet(sheetData);
+                    XLSX.utils.book_append_sheet(wb, ws, sem);
                 });
 
-                // 2. Headers (Rename 學號 -> 序號)
-                const headers = ["序號", "姓名", "班級", "學期", "本學期課程總數", "本學期多元總數"];
-                if (isSecondSemester) headers.push("學年度勾選課程件數", "學年度勾選多元件數", "老師最終核定");
-                headers.push("狀態提示", "錯誤明細", "修正建議", "優良註記");
-
-                // 3. Rows
-                const rows = allStudents.map(s => {
-                    const status = getStudentStatus(s);
-                    let label = status === 'approved' ? '已核定' : (status === 'error' ? '需修正' : (status === 'completed' ? '已達標' : '進行中'));
-                    if (status === 'empty') label = '未上傳';
-                    const err = [...(s.courseDetails || []).filter(d => d.status === 'error').map(d => `課程-${d.subject}`), ...(s.diverseDetails || []).filter(d => d.status === 'error').map(d => `多元-${d.type}`)].join("; ");
-                    const fb = [...(s.courseDetails || []).filter(d => d.status === 'error' && d.feedback).map(d => `課程-${d.subject}:${d.feedback}`), ...(s.diverseDetails || []).filter(d => d.status === 'error' && d.feedback).map(d => `多元-${d.type}:${d.feedback}`)].join(" | ");
-                    const goodFb = [...(s.courseDetails || []).filter(d => d.status === 'verified' && d.goodFeedback).map(d => `課程-${d.subject}:${d.goodFeedback}`), ...(s.diverseDetails || []).filter(d => d.status === 'verified' && d.goodFeedback).map(d => `多元-${d.type}:${d.goodFeedback}`)].join(" | ");
-
-                    const row = [s.id, s.name, s.class, currentSemester, (s.courseDetails?.length || 0), (s.diverseDetails?.length || 0)];
-                    if (isSecondSemester) {
-                        const checkedCourse = (s.courseDetails || []).filter(i => i.isChecked).length;
-                        const checkedDiverse = (s.diverseDetails || []).filter(i => i.isChecked).length;
-                        row.push(checkedCourse, checkedDiverse, s.isFinalApproved ? 'V' : '');
-                    }
-                    row.push(label, err, fb, goodFb);
-                    return row;
-                });
-
-                // 4. Statistics Summary
-                const statsRows = [];
-                statsRows.push(["", "", "", "", "", ""]); // Empty row
-                statsRows.push(["--- 統計摘要 ---", "", "", "", "", ""]);
-                statsRows.push(["班級", "總人數", "課程總件數", "課程參與率", "多元總件數", "多元參與率"]);
-
-                CLASSES.forEach(cls => {
-                    const students = (allData[currentSemester] || []).filter(s => s.class === cls);
-                    const totalStudents = students.length || 1;
-                    const courseCount = students.reduce((acc, s) => acc + (s.courseDetails?.length || 0), 0);
-                    const coursePart = Math.round((students.filter(s => (s.courseDetails?.length || 0) > 0).length / totalStudents) * 100) + "%";
-                    const diverseCount = students.reduce((acc, s) => acc + (s.diverseDetails?.length || 0), 0);
-                    const diversePart = Math.round((students.filter(s => (s.diverseDetails?.length || 0) > 0).length / totalStudents) * 100) + "%";
-                    statsRows.push([`${cls}班`, totalStudents, courseCount, coursePart, diverseCount, diversePart]);
-                });
-
-                let csv = "\uFEFF" + headers.join(",") + "\n" + rows.map(r => r.join(",")).join("\n") + "\n" + statsRows.map(r => r.join(",")).join("\n");
-                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-                const link = document.createElement("a");
-                link.href = URL.createObjectURL(blob);
-                link.download = `KCISLK_All_Classes_Report_${currentSemester}.csv`;
-                link.click();
+                XLSX.writeFile(wb, `${targetSemesters.join('_')}.xlsx`);
+                setIsExportModalOpen(false);
             };
+
+            const pInt = (v) => parseInt(v, 10) || 0;
 
             // UI 渲染
             // ... (rest is same until render)
@@ -774,7 +837,7 @@
                             ),
                             React.createElement('div', { className: "flex gap-4" },
                                 React.createElement('button', { onClick: () => setIsBackupModalOpen(true), className: "bg-white text-[#003366] px-5 py-4 rounded-2xl text-sm font-black shadow-xl flex items-center gap-2 hover:bg-slate-50 border-b-4 border-slate-200 active:border-0 transition-all" }, React.createElement(Cloud, { size: 20 }), "資料保全"),
-                                React.createElement('button', { onClick: exportToCSV, className: "bg-[#D4AF37] text-white px-8 py-4 rounded-2xl text-sm font-black shadow-xl flex items-center gap-2 hover:bg-[#B48F27] border-b-4 border-[#B48F27] active:border-0 transition-all" }, React.createElement(FileSpreadsheet, { size: 20 }), "匯出報表")
+                                React.createElement('button', { onClick: () => setIsExportModalOpen(true), className: "bg-[#D4AF37] text-white px-8 py-4 rounded-2xl text-sm font-black shadow-xl flex items-center gap-2 hover:bg-[#B48F27] border-b-4 border-[#B48F27] active:border-0 transition-all" }, React.createElement(FileSpreadsheet, { size: 20 }), "匯出報表")
                             )
                         )
                     )
@@ -836,7 +899,29 @@
                                                         React.createElement('div', { className: "flex flex-col md:flex-row items-center justify-between gap-10" },
                                                             React.createElement('div', { className: "space-y-4 flex-1" },
                                                                 React.createElement('h5', { className: "font-black text-[#003366] text-xl flex items-center gap-2" }, React.createElement(Award, { className: "text-[#D4AF37]" }), " 學年度結算核定"),
-                                                                React.createElement('p', { className: "text-xs text-slate-400 font-bold" }, "請勾選學生確認提交的檔案，完成後點擊核定。")
+                                                                React.createElement('p', { className: "text-xs text-slate-400 font-bold" }, "請勾選學生確認提交的檔案，完成後點擊核定。也可以手動輸入最終件數。"),
+                                                                React.createElement('div', { className: "flex gap-6 mt-4" },
+                                                                    React.createElement('div', { className: "flex items-center gap-2" },
+                                                                        React.createElement('span', { className: "text-xs font-black text-[#802050]" }, "課程勾選數:"),
+                                                                        React.createElement('input', {
+                                                                            type: "number",
+                                                                            className: "w-20 p-2 bg-white border border-slate-300 rounded-lg text-sm font-black text-[#003366] text-center focus:border-[#D4AF37] outline-none",
+                                                                            placeholder: (student.courseDetails || []).filter(i => i.isChecked).length,
+                                                                            value: student.finalCourseCount || '',
+                                                                            onChange: (e) => updateStudentFinalCounts(student.id, 'finalCourseCount', e.target.value)
+                                                                        })
+                                                                    ),
+                                                                    React.createElement('div', { className: "flex items-center gap-2" },
+                                                                        React.createElement('span', { className: "text-xs font-black text-[#003366]" }, "多元勾選數:"),
+                                                                        React.createElement('input', {
+                                                                            type: "number",
+                                                                            className: "w-20 p-2 bg-white border border-slate-300 rounded-lg text-sm font-black text-[#003366] text-center focus:border-[#D4AF37] outline-none",
+                                                                            placeholder: (student.diverseDetails || []).filter(i => i.isChecked).length,
+                                                                            value: student.finalDiverseCount || '',
+                                                                            onChange: (e) => updateStudentFinalCounts(student.id, 'finalDiverseCount', e.target.value)
+                                                                        })
+                                                                    )
+                                                                )
                                                             ),
                                                             React.createElement('button', { onClick: () => toggleFinalApproval(student.id), className: `px-12 py-5 rounded-2xl font-black text-sm transition-all shadow-xl flex items-center gap-2 h-fit ${student.isFinalApproved ? 'bg-slate-200 text-slate-400 hover:bg-slate-300' : 'bg-[#D4AF37] text-white hover:bg-[#B48F27] scale-105'}` }, student.isFinalApproved ? React.createElement(X, { size: 20 }) : React.createElement(CheckCircle2, { size: 20 }), student.isFinalApproved ? '取消核定' : '老師最終核定')
                                                         )
@@ -858,7 +943,13 @@
                                                                             React.createElement('div', { className: `w-14 h-14 rounded-2xl flex items-center justify-center font-black text-lg ${item.status === 'verified' ? 'bg-teal-50 text-[#409090]' : item.status === 'error' ? 'bg-red-50 text-[#802050]' : 'bg-slate-50 text-slate-400'}` }, item.subject[0]),
                                                                             React.createElement('div', {},
                                                                                 React.createElement('div', { className: "flex items-center gap-2" },
-                                                                                    React.createElement('span', { className: "font-black text-[#003366] block text-base tracking-tight" }, `${item.subject} 成果報告 ${total > 1 ? `#${idx}` : ''}`),
+                                                                                    React.createElement('span', { className: "font-black text-[#003366] block text-base tracking-tight" }, item.title || `${item.subject} 成果報告 ${total > 1 ? `#${idx}` : ''}`),
+                                                                                    React.createElement('button', {
+                                                                                        onClick: () => {
+                                                                                            const newTitle = prompt("請輸入新的標題名稱：", item.title || `${item.subject} 成果報告 ${total > 1 ? `#${idx}` : ''}`);
+                                                                                            if (newTitle && newTitle.trim()) updateItemTitle(student.id, 'courseDetails', item.id, newTitle.trim());
+                                                                                        }, className: "p-1.5 rounded-full hover:bg-slate-100 text-slate-400 transition-colors"
+                                                                                    }, React.createElement(Pencil, { size: 14 })),
                                                                                     React.createElement('button', { onClick: () => addItem(student.id, 'courseDetails', { subject: item.subject }), className: "text-[10px] bg-slate-100 text-slate-400 px-2 py-1 rounded-lg hover:bg-[#802050] hover:text-white transition-colors flex items-center gap-1 ml-2", title: "新增一份此科目的成果" }, React.createElement(Plus, { size: 10 }), " 增加")
                                                                                 )
                                                                             )
@@ -866,7 +957,7 @@
                                                                         React.createElement('div', { className: "flex items-center gap-2" },
                                                                             React.createElement('button', { onClick: () => setItemStatus(student.id, 'courseDetails', item.id, 'verified'), className: `p-3.5 rounded-2xl transition-all shadow-md ${item.status === 'verified' ? 'bg-[#409090] text-white' : 'bg-white text-slate-300 hover:text-[#409090]'}` }, React.createElement(Check, { size: 20 })),
                                                                             React.createElement('button', { onClick: () => setItemStatus(student.id, 'courseDetails', item.id, 'error'), className: `p-3.5 rounded-2xl transition-all shadow-md ${item.status === 'error' ? 'bg-[#802050] text-white' : 'bg-white text-slate-300 hover:text-[#802050]'}` }, React.createElement(AlertCircle, { size: 20 })),
-                                                                            React.createElement('button', { onClick: () => deleteItem(student.id, 'courseDetails', item.id), className: "p-3.5 text-slate-200 hover:text-red-400 transition-colors" }, React.createElement(Trash2, { size: 20 }))
+                                                                            React.createElement('button', { onClick: (e) => { e.stopPropagation(); deleteItem(student.id, 'courseDetails', item.id); }, className: "p-3.5 text-slate-200 hover:text-red-400 transition-colors" }, React.createElement(Trash2, { size: 20 }))
                                                                         )
                                                                     ),
                                                                     renderFeedbackSection(student.id, 'courseDetails', item),
@@ -891,6 +982,12 @@
                                                                             React.createElement('div', {},
                                                                                 React.createElement('div', { className: "flex items-center gap-2" },
                                                                                     React.createElement('span', { className: "font-black text-[#003366] text-base tracking-tight" }, `${item.title} ${total > 1 ? `#${idx}` : ''}`),
+                                                                                    React.createElement('button', {
+                                                                                        onClick: () => {
+                                                                                            const newTitle = prompt("請輸入新的標題名稱：", item.title);
+                                                                                            if (newTitle && newTitle.trim()) updateItemTitle(student.id, 'diverseDetails', item.id, newTitle.trim());
+                                                                                        }, className: "p-1.5 rounded-full hover:bg-slate-100 text-slate-400 transition-colors"
+                                                                                    }, React.createElement(Pencil, { size: 14 })),
                                                                                     React.createElement('button', { onClick: () => addItem(student.id, 'diverseDetails', { type: item.type, title: `${item.type}紀錄` }), className: "text-[10px] bg-slate-100 text-slate-400 px-2 py-1 rounded-lg hover:bg-[#003366] hover:text-white transition-colors flex items-center gap-1 ml-2", title: "新增一份此項目的紀錄" }, React.createElement(Plus, { size: 10 }), " 增加")
                                                                                 )
                                                                             )
@@ -898,7 +995,7 @@
                                                                         React.createElement('div', { className: "flex items-center gap-2" },
                                                                             React.createElement('button', { onClick: () => setItemStatus(student.id, 'diverseDetails', item.id, 'verified'), className: `p-3.5 rounded-2xl transition-all shadow-md ${item.status === 'verified' ? 'bg-[#409090] text-white' : 'bg-white text-slate-300 hover:text-[#409090]'}` }, React.createElement(Check, { size: 20 })),
                                                                             React.createElement('button', { onClick: () => setItemStatus(student.id, 'diverseDetails', item.id, 'error'), className: `p-3.5 rounded-2xl transition-all shadow-md ${item.status === 'error' ? 'bg-[#802050] text-white' : 'bg-white text-slate-300 hover:text-[#802050]'}` }, React.createElement(AlertCircle, { size: 20 })),
-                                                                            React.createElement('button', { onClick: () => deleteItem(student.id, 'diverseDetails', item.id), className: "p-3.5 text-slate-200 hover:text-red-400" }, React.createElement(Trash2, { size: 20 }))
+                                                                            React.createElement('button', { onClick: (e) => { e.stopPropagation(); deleteItem(student.id, 'diverseDetails', item.id); }, className: "p-3.5 text-slate-200 hover:text-red-400" }, React.createElement(Trash2, { size: 20 }))
                                                                         )
                                                                     ),
                                                                     renderFeedbackSection(student.id, 'diverseDetails', item),
@@ -923,6 +1020,36 @@
 
                     // Modals here...
 
+                    isExportModalOpen && React.createElement('div', { className: "fixed inset-0 bg-[#001122]/90 backdrop-blur-xl z-[70] flex items-center justify-center p-4 animate-in fade-in" },
+                        React.createElement('div', { className: "bg-white w-full max-w-lg rounded-[2rem] shadow-3xl overflow-hidden flex flex-col border-4 border-[#D4AF37]" },
+                            React.createElement('div', { className: "p-8 border-b bg-slate-50 flex items-center justify-between" },
+                                React.createElement('h3', { className: "text-xl font-black text-[#003366]" }, "選擇匯出學期"),
+                                React.createElement('button', { onClick: () => setIsExportModalOpen(false), className: "p-2 hover:bg-slate-200 rounded-full text-slate-400" }, React.createElement(X, { size: 24 }))
+                            ),
+                            React.createElement('div', { className: "p-8 space-y-4 max-h-[60vh] overflow-y-auto" },
+                                React.createElement('p', { className: "text-sm text-slate-500 font-bold mb-4" }, "請勾選您要匯出的學期資料："),
+                                semesters.map(sem => React.createElement('label', { key: sem, className: "flex items-center gap-4 p-4 rounded-xl border-2 border-slate-100 hover:border-[#D4AF37] hover:bg-amber-50 cursor-pointer transition-all select-none" },
+                                    React.createElement('input', {
+                                        type: "checkbox",
+                                        className: "w-5 h-5 accent-[#003366] rounded-md",
+                                        checked: selectedExportSemesters.includes(sem),
+                                        onChange: (e) => {
+                                            if (e.target.checked) setSelectedExportSemesters([...selectedExportSemesters, sem].sort());
+                                            else setSelectedExportSemesters(selectedExportSemesters.filter(s => s !== sem));
+                                        }
+                                    }),
+                                    React.createElement('span', { className: "text-[#003366] font-black text-lg" }, sem)
+                                ))
+                            ),
+                            React.createElement('div', { className: "p-8 border-t bg-slate-50" },
+                                React.createElement('button', {
+                                    onClick: () => exportToExcel(selectedExportSemesters),
+                                    disabled: selectedExportSemesters.length === 0,
+                                    className: "w-full py-4 bg-[#D4AF37] text-white rounded-xl font-black shadow-xl hover:bg-[#B48F27] disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
+                                }, React.createElement(Download, { size: 20 }), "確認匯出")
+                            )
+                        )
+                    ),
                     isStatsModalOpen && React.createElement('div', { className: "fixed inset-0 bg-[#001122]/95 backdrop-blur-xl z-[70] flex items-center justify-center p-4 overflow-y-auto" },
                         React.createElement('div', { className: "bg-white w-full max-w-7xl rounded-[3rem] shadow-3xl overflow-hidden flex flex-col max-h-[92vh] border-4 border-[#003366]/50 animate-in fade-in zoom-in duration-300" },
                             React.createElement('div', { className: "p-8 border-b bg-slate-50 flex items-center justify-between shrink-0" },
@@ -1068,8 +1195,8 @@
                                 React.createElement('button', { onClick: () => setIsImportModalOpen(false), className: "p-3 text-slate-400 hover:bg-slate-200 rounded-full transition-all" }, React.createElement(X, { size: 32 }))
                             ),
                             React.createElement('div', { className: "p-10 space-y-8 overflow-y-auto flex-1" },
-                                React.createElement('div', { className: "bg-[#003366] p-6 rounded-[2rem] flex items-center gap-5 text-white border-l-8 border-l-[#D4AF37]" }, React.createElement(ClipboardList, { size: 32, className: "text-[#F4CF60]" }), React.createElement('p', { className: "text-[13px] font-bold leading-relaxed" }, "同步到每學期。完成後將即時儲存並返回主畫面。")),
-                                React.createElement('textarea', { className: "w-full h-80 p-8 bg-slate-50 border-2 border-slate-100 rounded-[2rem] text-sm focus:border-[#D4AF37] transition-all resize-none font-black text-[#003366] outline-none", placeholder: "一行一位姓名...", value: importText, onChange: (e) => setImportText(e.target.value) })
+                                React.createElement('div', { className: "bg-[#003366] p-6 rounded-[2rem] flex items-center gap-5 text-white border-l-8 border-l-[#D4AF37]" }, React.createElement(ClipboardList, { size: 32, className: "text-[#F4CF60]" }), React.createElement('p', { className: "text-[13px] font-bold leading-relaxed" }, "請輸入座號與姓名 (空白鍵分隔)，例如: 01 王小明。同步到每學期，完成後將即時儲存並返回主畫面。")),
+                                React.createElement('textarea', { className: "w-full h-80 p-8 bg-slate-50 border-2 border-slate-100 rounded-[2rem] text-sm focus:border-[#D4AF37] transition-all resize-none font-black text-[#003366] outline-none", placeholder: "01 王小明\n02 李小華...", value: importText, onChange: (e) => setImportText(e.target.value) })
                             ),
                             React.createElement('div', { className: "p-10 border-t bg-slate-50 shrink-0" },
                                 React.createElement('div', { className: "flex gap-5" },
